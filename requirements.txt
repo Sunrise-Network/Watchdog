@@ -1,0 +1,4 @@
+discord
+mistralai
+python-dotenv
+jsonify
