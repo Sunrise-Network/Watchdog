@@ -169,3 +169,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# My scripts - Plexi09 - 18/01/2025
+start.sh
+manual_update.sh
