@@ -41,6 +41,7 @@ class BotConfig:
         
         missing_vars = [var for var in required_vars if not os.getenv(var)]
         if missing_vars:
+            ModBot.logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
             raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
             
         return cls(
@@ -56,10 +57,12 @@ class ConfigDB:
     """Gestion de la configuration par serveur dans une base SQLite"""
     def __init__(self, db_path: str = "bot_config.db"):
         self.db_path = db_path
+        self.logger = logging.getLogger(__name__)
         self._init_db()
 
     def _init_db(self) -> None:
         """Initialise la base de données"""
+        self.logger.info(f"Initializing database at {self.db_path}")
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS server_config (
@@ -68,16 +71,19 @@ class ConfigDB:
                     mod_channel_id INTEGER
                 )
             ''')
+            self.logger.info("Database initialization complete")
 
     async def get_config(self, guild_id: int) -> Tuple[Optional[int], Optional[int]]:
         """Récupère la configuration d'un serveur"""
         def _get():
             with sqlite3.connect(self.db_path) as conn:
+                self.logger.info(f"Fetching config for guild {guild_id}")
                 cursor = conn.execute(
                     'SELECT mod_role_id, mod_channel_id FROM server_config WHERE guild_id = ?',
                     (guild_id,)
                 )
                 result = cursor.fetchone()
+                self.logger.info(f"Loaded config for guild {guild_id}")
                 return result if result else (None, None)
                 
         return await asyncio.to_thread(_get)
@@ -87,6 +93,7 @@ class ConfigDB:
         """Met à jour la configuration d'un serveur"""
         def _set():
             with sqlite3.connect(self.db_path) as conn:
+                self.logger.info(f"Updating config for guild {guild_id}")
                 conn.execute('''
                     INSERT INTO server_config (guild_id, mod_role_id, mod_channel_id)
                     VALUES (?, ?, ?)
@@ -94,6 +101,7 @@ class ConfigDB:
                         mod_role_id = COALESCE(?, mod_role_id),
                         mod_channel_id = COALESCE(?, mod_channel_id)
                 ''', (guild_id, mod_role_id, mod_channel_id, mod_role_id, mod_channel_id))
+                self.logger.info(f"Updated config for guild {guild_id}")
 
         await asyncio.to_thread(_set)
 
@@ -135,6 +143,7 @@ class ModBot(commands.Bot):
             ]
         )
         self.logger = logging.getLogger(__name__)
+        self.logger.info("Logging system initialized")
 
     def _setup_commands(self) -> None:
         """Configure les commandes du bot"""
@@ -142,6 +151,7 @@ class ModBot(commands.Bot):
         @commands.has_permissions(administrator=True)
         async def set_mod_role(ctx: commands.Context, role: discord.Role):
             """Configure le rôle de modérateur pour le serveur"""
+            self.logger.info(f"Setting mod role for guild {ctx.guild.id}: {role.id}")
             await self.db.set_config(ctx.guild.id, mod_role_id=role.id)
             await ctx.send(f"✅ Rôle de modérateur configuré: {role.mention}")
 
@@ -149,6 +159,7 @@ class ModBot(commands.Bot):
         @commands.has_permissions(administrator=True)
         async def set_mod_channel(ctx: commands.Context, channel: discord.TextChannel):
             """Configure le salon de modération pour le serveur"""
+            self.logger.info(f"Setting mod channel for guild {ctx.guild.id}: {channel.id}")
             await self.db.set_config(ctx.guild.id, mod_channel_id=channel.id)
             await ctx.send(f"✅ Salon de modération configuré: {channel.mention}")
 
@@ -157,6 +168,7 @@ class ModBot(commands.Bot):
         async def show_config(ctx: commands.Context):
             """Affiche la configuration actuelle du serveur"""
             mod_role_id, mod_channel_id = await self.db.get_config(ctx.guild.id)
+            self.logger.info(f"Showing config for guild {ctx.guild.id}")
             
             embed = discord.Embed(
                 title="Configuration du serveur",
@@ -185,8 +197,10 @@ class ModBot(commands.Bot):
         async def config_error(ctx: commands.Context, error: commands.CommandError):
             if isinstance(error, commands.MissingPermissions):
                 await ctx.send("❌ Vous devez être administrateur pour utiliser cette commande.")
+                self.logger.warning("User missing permissions")
             elif isinstance(error, commands.MissingRequiredArgument):
                 await ctx.send("❌ Argument manquant. Veuillez vérifier la syntaxe de la commande.")
+                self.logger.warning("Missing argument in command")
             else:
                 await ctx.send("❌ Une erreur est survenue lors de l'exécution de la commande.")
                 self.logger.error(f"Command error: {error}")
@@ -202,13 +216,15 @@ class ModBot(commands.Bot):
     async def check_message(self, message: discord.Message) -> Optional[ModerationResult]:
         """Vérifie un message pour détecter du contenu inapproprié"""
         try:
+            self.logger.info(f"Moderating message from {message.author} ({message.author.id})")
             start_time = datetime.now()
             response = await asyncio.to_thread(
                 self.mistral_client.classifiers.moderate,
                 model="mistral-moderation-latest",
                 inputs=[message.content]
             )
-            latency = (datetime.now() - start_time).total_seconds()
+            latency = ((datetime.now() - start_time).total_seconds())/1000
+            self.logger.info(f"Moderation response received in {latency} milliseconds")
 
             violations = []
             for result in response.results:
@@ -231,13 +247,17 @@ class ModBot(commands.Bot):
     async def handle_violation(self, message: discord.Message, result: ModerationResult) -> None:
         """Gère une violation détectée"""
         try:
+            self.logger.info(f"Handling violation for message {message.id}")
             await message.delete()
+            self.logger.info(f"Message {message.id} deleted")
             
             # Créer l'embed pour l'utilisateur
             embed = self._create_violation_embed(message, result)
+            self.logger.info(f"Sending violation embed to {message.author}")
             await message.channel.send(embed=embed)
             
             # Récupérer la configuration du serveur
+            self.logger.info(f"Fetching server config for guild {message.guild.id}")
             mod_role_id, mod_channel_id = await self.get_server_config(message.guild.id)
             
             # Notifier les modérateurs
@@ -245,15 +265,13 @@ class ModBot(commands.Bot):
                 mod_channel = self.get_channel(mod_channel_id)
                 if mod_channel:
                     violation_report = self._create_violation_report(message, result)
-                    await mod_channel.send(
-                        f"<@&{mod_role_id}>\n```json\n{violation_report}\n```"
-                    )
+                    await mod_channel.send(f"<@&{mod_role_id}>" if mod_role_id else "⚠️ Aucun role de modérateur n'a été défini !", embed=violation_report)
+                    self.logger.info(f"Violation report sent to mod channel {mod_channel_id}")
                 else:
                     self.logger.error(f"Mod channel {mod_channel_id} not found")
             
             self.logger.info(
-                f"Message from {message.author} ({message.author.id}) "
-                f"deleted and reported for violation: {result.violations}"
+                f"Message from {message.author} ({message.author.id}) deleted and reported for violation: {result.violations}"
             )
         
         except Exception as e:
@@ -265,6 +283,7 @@ class ModBot(commands.Bot):
             f"{CATEGORY_DESCRIPTIONS.get(category, category)}: {round(score, 3)*100}%" 
             for category, score in result.violations
         ])
+        self.logger.info(f"Violation embed created for {message.author} ({message.author.id})")
         
         return discord.Embed(
             title="🚨 Automodération",
@@ -279,24 +298,26 @@ class ModBot(commands.Bot):
         ).add_field(name="ID", value=result.response_id
         ).set_thumbnail(url="https://cdn3.emoji.gg/emojis/2731-certified-moderator.png")
 
-    def _create_violation_report(self, message: discord.Message, result: ModerationResult) -> str:
+    def _create_violation_report(self, message: discord.Message, result: ModerationResult) -> discord.Embed:
         """Crée le rapport de violation pour les modérateurs"""
-        report = {
-            "timestamp": datetime.now().isoformat(),
-            "latency": result.latency,
-            "user": message.author.name,
-            "user_id": message.author.id,
-            "message": message.content,
-            "message_id": message.id,
-            "violations": [
-                {
-                    "category": category,
-                    "score": score
-                } for category, score in result.violations
-            ],
-            "response_id": result.response_id
-        }
-        return json.dumps(report, indent=4)
+        category_field_value = "\n".join([
+            f"{CATEGORY_DESCRIPTIONS.get(category, category)}: {round(score, 3)*100}%" 
+            for category, score in result.violations
+        ])
+        self.logger.info(f"Violation report created for message {message.id}")
+        
+        return discord.Embed(
+            title="🚨 Violation détectée",
+            description=(
+                f"{message.author.mention} a été signalé pour violation par le système d'auto modération."
+            ),
+            color=discord.Color.red()
+        ).add_field(name="Auteur", value=f"{message.author.mention} ({message.author.id})"
+        ).add_field(name="Catégories", value=category_field_value
+        ).add_field(name="ID", value=result.response_id
+        ).add_field(name="ID du message", value=message.id
+        ).add_field(name="Message", value=message.content
+        ).set_thumbnail(url="https://cdn3.emoji.gg/emojis/2731-certified-moderator.png")
 
     async def get_uptime(self) -> str:
         """Retourne le temps d'activité du bot"""
@@ -308,6 +329,7 @@ class ModBot(commands.Bot):
         hours = seconds // 3600
         minutes = (seconds % 3600) // 60
         seconds = seconds % 60
+        self.logger.info(f"Uptime requested: {days}d, {hours}h, {minutes}m, {seconds}s")
         return f"{days}d, {hours}h, {minutes}m, {seconds}s"
 
 async def main():
@@ -339,6 +361,7 @@ async def main():
         await bot.process_commands(message)
 
     try:
+        bot.logger.info(f"Starting {bot.config.bot_name} v{bot.config.bot_version}")
         await bot.start(bot.config.discord_token)
     except Exception as e:
         bot.logger.error(f"Failed to start bot: {e}")
